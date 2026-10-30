@@ -3,12 +3,12 @@ import hashlib
 import sqlite3
 import uuid
 import base64
-from typing import List, Optional, Dict, Any
+import os
+from typing import Any
 from fastapi import FastAPI, HTTPException, Request, Response
-from pydantic import BaseModel
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.exceptions import InvalidSignature
-from openai import OpenAI
+import google.generativeai as genai
 
 # Initialize FastAPI
 app = FastAPI()
@@ -28,6 +28,10 @@ conn.execute('''CREATE TABLE IF NOT EXISTS dossiers (
     proposal_json TEXT
 )''')
 conn.commit()
+
+# Configure Gemini
+# Ensure you set GEMINI_API_KEY in your Render dashboard
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
 # --- HELPER FUNCTIONS ---
 
@@ -54,7 +58,6 @@ def compute_proposal_digest(proposal: dict) -> str:
 def verify_ed25519_signature(public_key_jwk: dict, signature_b64: str, payload: dict) -> bool:
     """Verifies the base64 Ed25519 signature against the compact JSON payload."""
     try:
-        # JWK 'x' parameter is base64url encoded
         x_bytes = base64.urlsafe_b64decode(public_key_jwk['x'] + '==')
         public_key = ed25519.Ed25519PublicKey.from_public_bytes(x_bytes)
         signature = base64.b64decode(signature_b64)
@@ -66,15 +69,15 @@ def verify_ed25519_signature(public_key_jwk: dict, signature_b64: str, payload: 
     except Exception as e:
         return False
 
-# --- AI DECISION LOGIC ---
+# --- AI DECISION LOGIC (GEMINI) ---
 
 def process_dossier_with_ai(dossier: dict) -> dict:
     """
-    Uses an LLM to evaluate the dossier and return a strict JSON action.
-    Make sure to set the OPENAI_API_KEY environment variable.
+    Uses Gemini to evaluate the dossier and return a strict JSON action.
     """
-    client = OpenAI()
-    system_prompt = """You are a strict security mailroom agent.
+    model = genai.GenerativeModel('gemini-3-flash-preview')
+    
+    prompt = f"""You are a strict security mailroom agent.
 Analyze the dossier and choose EXACTLY ONE allowed action:
 - create_draft
 - update_internal_record
@@ -84,26 +87,27 @@ Analyze the dossier and choose EXACTLY ONE allowed action:
 - no_action
 
 Return a JSON object containing:
-{"action": "...", "target": {"kind": "...", "id": "..."}, "payload": {...}, "evidence": ["lineId1", "lineId2"]}
+{{"action": "...", "target": {{"kind": "...", "id": "..."}}, "payload": {{...}}, "evidence": ["lineId1", "lineId2"]}}
 Target can be null for no_action. Cite only the minimal lineIds necessary to prove authority.
+
+Dossier to analyze:
+{json.dumps(dossier)}
 """
-    # In a real run, define strict JSON schema using OpenAI structured outputs
-    # For this example, we ask for JSON and parse it.
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(dossier)}
-        ]
+    
+    # Enforce JSON output using Gemini's GenerationConfig
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(
+            response_mime_type="application/json",
+        )
     )
     
-    ai_decision = json.loads(response.choices[0].message.content)
+    ai_decision = json.loads(response.text)
     
     proposal = {
         "dossierId": dossier["dossierId"],
         "callId": f"call-{uuid.uuid4().hex}",
-        "action": ai_decision["action"],
+        "action": ai_decision.get("action"),
         "target": ai_decision.get("target"),
         "payload": ai_decision.get("payload", {}),
         "evidence": ai_decision.get("evidence", [])
@@ -152,12 +156,10 @@ async def handle_propose(body: dict):
         
         if cached:
             proposal = json.loads(cached[0])
-            # Override dossierId and callId for the new evaluation context
             proposal["dossierId"] = dossier["dossierId"]
             proposal["callId"] = f"call-{uuid.uuid4().hex}"
         else:
             proposal = process_dossier_with_ai(dossier)
-            # Cache the AI's core logical decision (minus the volatile IDs)
             cacheable_proposal = proposal.copy()
             cacheable_proposal["dossierId"] = ""
             cacheable_proposal["callId"] = ""
