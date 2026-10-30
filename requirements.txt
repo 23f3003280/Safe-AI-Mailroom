@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+cryptography
+google-generativeai
+pydantic
+pydantic-settings
